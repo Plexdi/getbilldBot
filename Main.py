@@ -17,7 +17,7 @@ CHANNEL_WEEKLY      = 1407506115952119818          # #weekly-progress
 ROLE_VALIDATOR      = 1407743740885602337          # Validator role ID
 ROLE_SENIOR_VALID   = 1407743878551044207          # optional; else set same as ROLE_VALIDATOR
 ''
-VALIDATION_QUORUM   = 3                           # e.g., 3 validators for approval (scale to 5 later)
+VALIDATION_QUORUM   = 1                           # e.g., 3 validators for approval (scale to 5 later)
 MIN_REF_CHARS       = 150                         # minimum reflection length
 MIN_HOURS           = 20                          # cooldown lower bound
 MAX_HOURS           = 28                          # cooldown upper bound
