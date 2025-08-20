@@ -1,2 +1,3 @@
-echo ".env" >> .gitignore
-
+.env
+streaks.db
+__pycache__/
