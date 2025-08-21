@@ -409,118 +409,148 @@ tree.add_command(admin)
 # ======= Reaction listener for quorum =======
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    # --- quick debug: comment in if needed ---
+    # print(f"[raw_react] emoji={payload.emoji} ch={payload.channel_id} msg={payload.message_id} user={payload.user_id}")
+
+    # 1) Filter for the right emoji and channel
     if str(payload.emoji) != "✅":
         return
     if payload.channel_id != CHANNEL_CHECKINS:
         return
 
     guild = bot.get_guild(GUILD_ID)
-    member = guild.get_member(payload.user_id)
-    if not member or member.bot:
+    if not guild:
+        return
+
+    # 2) Resolve the reacting member robustly
+    member = getattr(payload, "member", None)
+    if member is None:
+        member = guild.get_member(payload.user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except Exception:
+            return
+
+    # ignore bots and non-validators
+    if member.bot:
         return
     if not is_validator(member):
         return
 
+    # 3) Fetch the message we reacted to
     chan = guild.get_channel(payload.channel_id)
+    if not chan:
+        return
     try:
         msg = await chan.fetch_message(payload.message_id)
-    except:
+    except Exception:
         return
 
-    # check if this message is a pending check-in
+    # 4) Look up the pending check-in row for this message
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id FROM checkins WHERE message_id=? AND status='pending'", (msg.id,))
+        cur = await db.execute(
+            "SELECT id, user_id, status FROM checkins WHERE message_id=?",
+            (msg.id,)
+        )
         row = await cur.fetchone()
 
     if not row:
         return
 
-    checkin_id = row[0]
-    result = await approve_checkin(checkin_id, member.id, guild)  # 👈 hook into DB logic
+    chk_id, target_uid, status = row
+    if status != "pending":
+        return
 
-    if result:
-        uid, streak = result
-        await msg.channel.send(f"✅ Check-in approved for <@{uid}>! Current streak: **{streak} days**")
-
-
-    # fetch checkin
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id, user_id, status FROM checkins WHERE message_id=?", (msg.id,))
-        row = await cur.fetchone()
-        if not row: return
-        chk_id, target_uid, status = row
-        if status != "pending": return
-
-        # count validator reactions (weighted)
-        validators = set()
-        weight_sum = 0.0
-        for reaction in msg.reactions:
-            if str(reaction.emoji) == "✅":
-                async for user in reaction.users():
-                    if user.bot: continue
-                    m = guild.get_member(user.id)
-                    if m and is_validator(m):
+    # 5) Count validator reactions (weighted), including this new reaction
+    validators = set()
+    weight_sum = 0.0
+    for reaction in msg.reactions:
+        # Some emojis come through as PartialEmoji; compare by string
+        if str(reaction.emoji) == "✅":
+            async for u in reaction.users():
+                if u.bot:
+                    continue
+                m = guild.get_member(u.id) or (await guild.fetch_member(u.id))
+                if m and is_validator(m):
+                    if m.id not in validators:
                         validators.add(m.id)
                         weight_sum += weight_for(m)
 
-        if weight_sum >= VALIDATION_QUORUM:
-            # APPROVE
-            # increment streak with cooldown enforcement
-            # load user
-            cur2 = await db.execute("SELECT current_streak,longest_streak,last_checkin_at FROM users WHERE user_id=?", (target_uid,))
-            u = await cur2.fetchone()
-            last_iso = u[2] if u else None
-            hrs = hours_since(last_iso)
-            if u is None:
-                current,longest = 0,0
-            else:
-                current,longest = u[0],u[1]
+    # 6) If quorum not reached yet, stop here
+    if weight_sum < VALIDATION_QUORUM:
+        return
 
-            # If too soon (< MIN_HOURS), mark rejected to avoid gaming via reactions
-            if last_iso and hrs < MIN_HOURS:
-                await db.execute("UPDATE checkins SET status='rejected', reason='cooldown' WHERE id=?", (chk_id,))
-                await db.commit()
-                await post_log(guild, f"❌ Rejected (cooldown) for <@{target_uid}> on #{chk_id}")
-                return
+    # 7) Quorum reached: APPROVE the check-in and update streaks (schema = current_streak/longest_streak)
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Double-check still pending (avoid race)
+        cur = await db.execute("SELECT status FROM checkins WHERE id=?", (chk_id,))
+        st_row = await cur.fetchone()
+        if not st_row or st_row[0] != "pending":
+            return
 
-            current += 1
-            longest = max(longest, current)
-            nowiso = now_utc().isoformat()
-            await db.execute("""
-                INSERT INTO users(user_id,current_streak,longest_streak,last_checkin_at)
-                VALUES(?,?,?,?)
-                ON CONFLICT(user_id) DO UPDATE SET current_streak=?,
-                                                  longest_streak=?,
-                                                  last_checkin_at=?
-            """, (target_uid, current, longest, nowiso, current, longest, nowiso))
-            await db.execute("UPDATE checkins SET status='approved' WHERE id=?", (chk_id,))
-            await db.commit()
-
-            try:
-                user = guild.get_member(target_uid)
-                if user:
-                    await user.send(f"✅ Your check-in was approved. New streak: **{current}** days.")
-            except: pass
-
-            embed = msg.embeds[0]
-            new_embed = discord.Embed(
-                title=embed.title,
-                description=embed.description,
-                color=discord.Color.green()
+        # Cooldown enforcement
+        cur = await db.execute(
+            "SELECT current_streak,longest_streak,last_checkin_at FROM users WHERE user_id=?",
+            (target_uid,)
+        )
+        u = await cur.fetchone()
+        last_iso = u[2] if u else None
+        hrs = hours_since(last_iso)
+        if last_iso and hrs < MIN_HOURS:
+            await db.execute(
+                "UPDATE checkins SET status='rejected', reason='cooldown' WHERE id=?",
+                (chk_id,)
             )
-            for field in embed.fields:
-                new_embed.add_field(name=field.name, value=field.value, inline=field.inline)
+            await db.commit()
+            await post_log(guild, f"❌ Rejected (cooldown) for <@{target_uid}> on #{chk_id}")
+            return
 
-            if embed.footer:
-                new_embed.set_footer(text=embed.footer.text, icon_url=embed.footer.icon_url)
+        current = (u[0] if u else 0) + 1
+        longest = max(u[1], current) if u else current
+        nowiso = now_utc().isoformat()
 
-            if embed.author:
-                new_embed.set_author(name=embed.author.name, icon_url=embed.author.icon_url)
+        # Write user streak + approve the check-in
+        await db.execute("""
+            INSERT INTO users(user_id,current_streak,longest_streak,last_checkin_at)
+            VALUES(?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET current_streak=?,
+                                              longest_streak=?,
+                                              last_checkin_at=?
+        """, (target_uid, current, longest, nowiso, current, longest, nowiso))
 
-            await msg.edit(embed=new_embed)
+        await db.execute("UPDATE checkins SET status='approved' WHERE id=?", (chk_id,))
+        await db.commit()
 
-            await post_log(guild, f"✅ Approved by quorum: <@{target_uid}> → {current} days (check-in #{chk_id})")
-            await update_leaderboard(guild)
+    # 8) DM user (best effort), update embed color, log, refresh leaderboard
+    try:
+        user = guild.get_member(target_uid) or await guild.fetch_member(target_uid)
+        if user:
+            try:
+                await user.send(f"✅ Your check-in was approved. New streak: **{current}** days.")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Rebuild the embed in green while preserving fields/footer/author
+    try:
+        old = msg.embeds[0]
+        new_e = discord.Embed(title=old.title, description=old.description, color=discord.Color.green())
+        for f in old.fields:
+            new_e.add_field(name=f.name, value=f.value, inline=f.inline)
+        if old.footer:
+            new_e.set_footer(text=old.footer.text, icon_url=getattr(old.footer, "icon_url", None))
+        if old.author:
+            new_e.set_author(name=old.author.name, icon_url=getattr(old.author, "icon_url", None))
+        await msg.edit(embed=new_e)
+    except Exception:
+        pass
+
+    await msg.channel.send(f"✅ Check-in approved for <@{target_uid}>! Current streak: **{current}** days")
+    await post_log(guild, f"✅ Approved by quorum: <@{target_uid}> → {current} days (check-in #{chk_id})")
+    await update_leaderboard(guild)
+
 
 # ======= Background task: expire pending after 24h & freeze weekly =======
 async def maintenance_loop():
