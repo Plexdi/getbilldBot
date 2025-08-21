@@ -244,10 +244,36 @@ class CheckinModal(discord.ui.Modal, title="Daily Check-in"):
         await post_log(guild, f"📝 New check-in pending: <@{user.id}> Day {day_num}{flag_txt} (id {chk_id})")
 
 # ======= Slash Commands =======
-@tree.command(name="checkin", description="Submit your daily check-in")
-# @app_commands.guilds(TEST_GUILD)  # for testing; remove in production
-async def checkin_cmd(interaction: discord.Interaction):
-    await interaction.response.send_modal(CheckinModal(interaction.user))
+@tree.command(name="checkins", description="Show the current leaderboard")
+async def checkins(interaction: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Make sure table exists
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS streaks (
+                user_id TEXT PRIMARY KEY,
+                streak INTEGER
+            )
+        """)
+        await db.commit()
+
+        # Fetch top 10 streaks
+        async with db.execute("SELECT user_id, streak FROM streaks ORDER BY streak DESC LIMIT 10") as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        await interaction.response.send_message("No check-ins yet!", ephemeral=True)
+        return
+
+    # Format leaderboard text
+    leaderboard = "\n".join([f"<@{row[0]}> — {row[1]} days" for row in rows])
+
+    embed = discord.Embed(
+        title="🏆 Check-in Leaderboard",
+        description=leaderboard,
+        color=0xFFD700
+    )
+    await interaction.response.send_message(embed=embed)
+
 
 @tree.command(name="streak", description="View your current streak")
 # @app_commands.guilds(TEST_GUILD)  # for testing; remove in production
