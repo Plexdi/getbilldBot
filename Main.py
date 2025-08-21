@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS meta(
 """
 
 async def init_db():
-    async with aiosqlite.connect("streaks.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_SQL)
         await db.commit()
 
@@ -110,7 +110,7 @@ async def ensure_leaderboard_message(guild):
     # Make sure schema exists
     await init_db()
 
-    async with aiosqlite.connect("streaks.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         # Try to read existing message id
         row = await db_fetchone(db, "SELECT value FROM meta WHERE key='lb_msg_id'")
         channel = guild.get_channel(CHANNEL_LEADERBOARD)
