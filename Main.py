@@ -244,35 +244,25 @@ class CheckinModal(discord.ui.Modal, title="Daily Check-in"):
         await post_log(guild, f"📝 New check-in pending: <@{user.id}> Day {day_num}{flag_txt} (id {chk_id})")
 
 # ======= Slash Commands =======
-@tree.command(name="checkins", description="Show the current leaderboard")
-async def checkins(interaction: discord.Interaction):
+@tree.command(name="checkin", description="Submit your daily check-in with reflection and optional image")
+@app_commands.describe(day="Day number", reflection="Your reflection for today")
+async def checkin(interaction: discord.Interaction, day: int, reflection: str, image: discord.Attachment = None):
     async with aiosqlite.connect(DB_PATH) as db:
-        # Make sure table exists
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS streaks (
-                user_id TEXT PRIMARY KEY,
-                streak INTEGER
+            CREATE TABLE IF NOT EXISTS checkins (
+                user_id TEXT,
+                day INTEGER,
+                reflection TEXT,
+                image_url TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("INSERT INTO checkins (user_id, day, reflection, image_url) VALUES (?, ?, ?, ?)",
+                         (str(interaction.user.id), day, reflection, image.url if image else None))
         await db.commit()
 
-        # Fetch top 10 streaks
-        async with db.execute("SELECT user_id, streak FROM streaks ORDER BY streak DESC LIMIT 10") as cursor:
-            rows = await cursor.fetchall()
+    await interaction.response.send_message(f"✅ Check-in saved for Day {day}!", ephemeral=True)
 
-    if not rows:
-        await interaction.response.send_message("No check-ins yet!", ephemeral=True)
-        return
-
-    # Format leaderboard text
-    leaderboard = "\n".join([f"<@{row[0]}> — {row[1]} days" for row in rows])
-
-    embed = discord.Embed(
-        title="🏆 Check-in Leaderboard",
-        description=leaderboard,
-        color=0xFFD700
-    )
-    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="streak", description="View your current streak")
