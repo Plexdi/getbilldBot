@@ -6,8 +6,17 @@ from discord.ext import commands
 from dotenv import load_dotenv
 load_dotenv()
 
+# ======= MILESTONE ROLES =======
+ROLE_ONE_WEEK_WARRIOR = 1408191945628586004  # Day 7
+ROLE_STREAK_GUARDIAN  = 1408192079049396384  # Day 30
+ROLE_ACHIEVER         = 1408192728394760312  # Day 70
+ROLE_STREAK_VETERAN   = 1408192164718186699  # Day 100
+ROLE_STREAK_MASTER    = 1408192248637821079  # Day 180
+ROLE_LEGENDARY        = 1408192337074589787  # Day 365
+ROLE_IMMORTAL         = 1408192403231477824  # Day 730+
 
-# ======= CONFIG (FILL THESE) =======
+
+# ======= CONFIG =======
 GUILD_ID            = 1407504761263095989         # your server ID
 CHANNEL_CHECKINS    = 1407505632457658399          # #daily-check-in
 CHANNEL_LEADERBOARD = 1407505097503543397          # #streak-leaderboard
@@ -427,6 +436,68 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # --- quick debug: comment in if needed ---
     # print(f"[raw_react] emoji={payload.emoji} ch={payload.channel_id} msg={payload.message_id} user={payload.user_id}")
 
+    # Highest milestone at/under the user's streak
+    MILESTONES = [
+        (730, ROLE_IMMORTAL),
+        (365, ROLE_LEGENDARY),
+        (180, ROLE_STREAK_MASTER),
+        (100, ROLE_STREAK_VETERAN),
+        (70,  ROLE_ACHIEVER),
+        (30,  ROLE_STREAK_GUARDIAN),
+        (7,   ROLE_ONE_WEEK_WARRIOR),
+    ]
+
+    def _target_role_for_streak(streak: int) -> int | None:
+        for threshold, role_id in MILESTONES:
+            if streak >= threshold and role_id:
+                return role_id
+        return None
+
+    def _all_milestone_role_ids() -> set[int]:
+        return {rid for _, rid in MILESTONES if rid}
+
+    async def update_milestone_roles(guild: discord.Guild, member: discord.Member, streak_value: int):
+        """Give the correct milestone role for streak_value and remove the others."""
+        target_role_id = _target_role_for_streak(streak_value)
+        if not target_role_id:
+            # under 7 days → remove any milestone roles if they have them
+            remove_ids = _all_milestone_role_ids()
+            roles_to_remove = [guild.get_role(rid) for rid in remove_ids if guild.get_role(rid) in member.roles]
+            if roles_to_remove:
+                try:
+                    await member.remove_roles(*roles_to_remove, reason=f"Streak {streak_value} (below first milestone)")
+                except Exception:
+                    pass
+            return
+
+        target_role = guild.get_role(target_role_id)
+        if not target_role:
+            return  # role not found / not set
+
+        # Build remove list = all milestone roles except the target
+        to_remove_ids = _all_milestone_role_ids() - {target_role_id}
+        roles_to_remove = [guild.get_role(rid) for rid in to_remove_ids if guild.get_role(rid) in member.roles]
+
+        # Add target if missing; remove the rest
+        ops = []
+        if target_role not in member.roles:
+            ops.append(("add", target_role))
+        if roles_to_remove:
+            ops.extend([("rem", r) for r in roles_to_remove])
+
+        # Apply in a safe order: add first, then remove others (prevents gaps if hierarchy blocks something)
+        try:
+            if any(k == "add" for k, _ in ops):
+                await member.add_roles(target_role, reason=f"Streak {streak_value} reached")
+            if roles_to_remove:
+                await member.remove_roles(*roles_to_remove, reason=f"Streak {streak_value} reached (clean up)")
+        except discord.Forbidden:
+            # Bot lacks Manage Roles or the roles are above the bot's top role.
+            await post_log(guild, "⚠️ Could not assign milestone role (check role hierarchy & permissions).")
+        except Exception as e:
+            await post_log(guild, f"⚠️ Role assign error: {e}")
+
+
     # 1) Filter for the right emoji and channel
     if str(payload.emoji) != "✅":
         return
@@ -536,6 +607,13 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
         await db.execute("UPDATE checkins SET status='approved' WHERE id=?", (chk_id,))
         await db.commit()
+
+    try:
+        member_to_update = guild.get_member(target_uid) or await guild.fetch_member(target_uid)
+        if member_to_update: 
+            await update_milestone_roles(guild, member_to_update, current)
+    except Exception as e: 
+        await post_log(guild, f"⚠️ Error updating roles for <@{target_uid}>: {e}")
 
     # 8) DM user (best effort), update embed color, log, refresh leaderboard
     try:
