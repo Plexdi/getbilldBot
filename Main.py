@@ -89,6 +89,42 @@ async def db_fetchone(db, query, *params):
 
 
 # ======= Utilities =======
+async def approve_checkin(checkin_id: int, validator_id: int, guild: discord.Guild):
+    async with aiosqlite.connect(DB_PATH) as db:
+        # fetch the checkin
+        cur = await db.execute("SELECT user_id, created_at FROM checkins WHERE id=?", (checkin_id,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        user_id, created_at = row
+
+        # mark as approved
+        await db.execute("UPDATE checkins SET status='approved' WHERE id=?", (checkin_id,))
+
+        # streak logic
+        cur = await db.execute("SELECT last_checkin_at, streak_count FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        last_iso, streak = row if row else (None, 0)
+
+        hrs = hours_since(last_iso)
+        if hrs <= MAX_HOURS:  # continued streak
+            streak += 1
+        else:
+            streak = 1  # reset streak
+
+        now = now_utc().isoformat()
+        await db.execute("""
+            INSERT INTO users(user_id, last_checkin_at, streak_count)
+            VALUES(?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET last_checkin_at=excluded.last_checkin_at,
+                                              streak_count=excluded.streak_count
+        """, (user_id, now, streak))
+
+        await db.commit()
+
+    return user_id, streak
+
+
 def now_utc():
     return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
 
@@ -223,6 +259,8 @@ class CheckinModal(discord.ui.Modal, title="Daily Check-in"):
             cur = await db.execute("SELECT last_insert_rowid()")
             chk_id = (await cur.fetchone())[0]
 
+        
+
         # post pending card
         chan = guild.get_channel(CHANNEL_CHECKINS)
         embed = discord.Embed(title=f"Pending Check-in • {user.display_name}",
@@ -244,25 +282,31 @@ class CheckinModal(discord.ui.Modal, title="Daily Check-in"):
         await post_log(guild, f"📝 New check-in pending: <@{user.id}> Day {day_num}{flag_txt} (id {chk_id})")
 
 # ======= Slash Commands =======
-@tree.command(name="checkin", description="Submit your daily check-in with reflection and optional image")
-@app_commands.describe(day="Day number", reflection="Your reflection for today")
-async def checkin(interaction: discord.Interaction, day: int, reflection: str, image: discord.Attachment = None):
+@tree.command(name="checkin", description="Submit your daily check-in")
+# @app_commands.guilds(TEST_GUILD)  # for testing; remove in production
+async def checkin_cmd(interaction: discord.Interaction):
+    await interaction.response.send_modal(CheckinModal(interaction.user))
+
+@tree.command(name="leaderboard", description="Show top streaks")
+async def leaderboard_cmd(interaction: discord.Interaction):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS checkins (
-                user_id TEXT,
-                day INTEGER,
-                reflection TEXT,
-                image_url TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
+        cur = await db.execute("""
+            SELECT user_id, streak_count 
+            FROM users 
+            ORDER BY streak_count DESC 
+            LIMIT 10
         """)
-        await db.execute("INSERT INTO checkins (user_id, day, reflection, image_url) VALUES (?, ?, ?, ?)",
-                         (str(interaction.user.id), day, reflection, image.url if image else None))
-        await db.commit()
+        rows = await cur.fetchall()
 
-    await interaction.response.send_message(f"✅ Check-in saved for Day {day}!", ephemeral=True)
+    if not rows:
+        return await interaction.response.send_message("No check-ins yet.", ephemeral=True)
 
+    desc = "\n".join(
+        f"**{i+1}.** <@{uid}> — 🔥 {streak} days"
+        for i, (uid, streak) in enumerate(rows)
+    )
+    embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="streak", description="View your current streak")
@@ -365,18 +409,39 @@ tree.add_command(admin)
 # ======= Reaction listener for quorum =======
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if str(payload.emoji) != "✅": return
-    if payload.channel_id != CHANNEL_CHECKINS: return
+    if str(payload.emoji) != "✅":
+        return
+    if payload.channel_id != CHANNEL_CHECKINS:
+        return
+
     guild = bot.get_guild(GUILD_ID)
     member = guild.get_member(payload.user_id)
-    if not member or member.bot: return
-    if not is_validator(member): return
+    if not member or member.bot:
+        return
+    if not is_validator(member):
+        return
 
     chan = guild.get_channel(payload.channel_id)
     try:
         msg = await chan.fetch_message(payload.message_id)
     except:
         return
+
+    # check if this message is a pending check-in
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id FROM checkins WHERE message_id=? AND status='pending'", (msg.id,))
+        row = await cur.fetchone()
+
+    if not row:
+        return
+
+    checkin_id = row[0]
+    result = await approve_checkin(checkin_id, member.id, guild)  # 👈 hook into DB logic
+
+    if result:
+        uid, streak = result
+        await msg.channel.send(f"✅ Check-in approved for <@{uid}>! Current streak: **{streak} days**")
+
 
     # fetch checkin
     async with aiosqlite.connect(DB_PATH) as db:
