@@ -468,6 +468,233 @@ async def maintenance_loop():
             except: pass
         await asyncio.sleep(1800)  # run every 30 minutes
 
+# ================== Daily Motivation ==================
+# Config: paste your messages here ↓↓↓
+QUOTES: list[str] = [
+  "Believe in yourself, and you are halfway there.",
+  "Success is not final, failure is not fatal: it is the courage to continue that counts.",
+  "Dream big and dare to fail.",
+  "Don’t watch the clock; do what it does. Keep going.",
+  "Act as if what you do makes a difference. It does.",
+  "Your limitation—it’s only your imagination.",
+  "Push yourself, because no one else is going to do it for you.",
+  "Great things never come from comfort zones.",
+  "Dream it. Wish it. Do it.",
+  "Success doesn’t just find you. You have to go out and get it.",
+  "The harder you work for something, the greater you’ll feel when you achieve it.",
+  "Don’t stop when you’re tired. Stop when you’re done.",
+  "Wake up with determination. Go to bed with satisfaction.",
+  "Do something today that your future self will thank you for.",
+  "Little things make big days.",
+  "It’s going to be hard, but hard does not mean impossible.",
+  "Don’t wait for opportunity. Create it.",
+  "Sometimes we’re tested not to show our weaknesses, but to discover our strengths.",
+  "The key to success is to focus on goals, not obstacles.",
+  "Dream it. Believe it. Build it.",
+  "Difficult roads often lead to beautiful destinations.",
+  "Opportunities don’t happen. You create them.",
+  "The way to get started is to quit talking and begin doing.",
+  "Don’t limit your challenges. Challenge your limits.",
+  "Believe you can and you’re halfway there.",
+  "The secret to getting ahead is getting started.",
+  "Everything you’ve ever wanted is on the other side of fear.",
+  "Doubt kills more dreams than failure ever will.",
+  "Failure is not the opposite of success; it’s part of success.",
+  "Work hard in silence, let your success be the noise.",
+  "Don’t let yesterday take up too much of today.",
+  "Keep your eyes on the stars, and your feet on the ground.",
+  "It always seems impossible until it’s done.",
+  "Perseverance is not a long race; it is many short races one after the other.",
+  "Strength grows in the moments you think you can’t go on but you keep going anyway.",
+  "Don’t wish it were easier. Wish you were better.",
+  "Your passion is waiting for your courage to catch up.",
+  "If you can dream it, you can do it.",
+  "Success usually comes to those who are too busy to be looking for it.",
+  "The future depends on what you do today.",
+  "Hard work beats talent when talent doesn’t work hard.",
+  "The only way to achieve the impossible is to believe it is possible.",
+  "Start where you are. Use what you have. Do what you can.",
+  "Success is the sum of small efforts repeated day in and day out.",
+  "Fall seven times and stand up eight.",
+  "Winners are not afraid of losing. But losers are.",
+  "When you feel like quitting, remember why you started.",
+  "Don’t count the days, make the days count.",
+  "The man who moves a mountain begins by carrying away small stones.",
+  "Success doesn’t come from what you do occasionally, it comes from what you do consistently.",
+  "You don’t have to be great to start, but you have to start to be great.",
+  "Don’t give up. Great things take time.",
+  "Discipline is the bridge between goals and accomplishment.",
+  "If it doesn’t challenge you, it won’t change you.",
+  "Your only limit is you.",
+  "Stay positive, work hard, make it happen.",
+  "Success is walking from failure to failure with no loss of enthusiasm.",
+  "Big journeys begin with small steps.",
+  "Hustle in silence and let your success make the noise.",
+  "Don’t fear failure. Fear being in the exact same place next year as you are today.",
+  "Work hard, stay humble.",
+  "Stop doubting yourself, work hard, and make it happen.",
+  "Great things never come from comfort zones.",
+  "Push harder than yesterday if you want a different tomorrow.",
+  "Doubt kills more dreams than failure ever will.",
+  "You are stronger than you think.",
+  "What seems hard now will one day be your warm-up.",
+  "Stay focused and never give up.",
+  "Don’t be afraid to give up the good to go for the great.",
+  "Difficulties in life are intended to make us better, not bitter.",
+  "Be so good they can’t ignore you.",
+  "One day or day one. You decide.",
+  "Winners never quit, and quitters never win.",
+  "A little progress each day adds up to big results.",
+  "Don’t tell people your dreams. Show them.",
+  "When you feel like giving up, remember why you held on for so long in the first place.",
+  "The only place where success comes before work is in the dictionary.",
+  "Stop waiting for things to happen. Go out and make them happen.",
+  "Success is not for the lazy.",
+  "Do what you can with all you have, wherever you are.",
+  "Sometimes later becomes never. Do it now.",
+  "Success is what comes after you stop making excuses.",
+  "Don’t let the fear of losing be greater than the excitement of winning.",
+  "Your time is limited, don’t waste it living someone else’s life.",
+  "Motivation gets you started, discipline keeps you going.",
+  "Failure will never overtake me if my determination to succeed is strong enough.",
+  "Be fearless in the pursuit of what sets your soul on fire.",
+  "Don’t stop until you’re proud.",
+  "Chase your dreams until you catch them… and then dream, catch, and dream again!",
+  "Small progress is still progress.",
+  "Don’t wait. The time will never be just right.",
+  "Don’t call it a dream, call it a plan.",
+  "Your dream doesn’t have an expiration date. Take a deep breath and try again.",
+  "Push yourself because no one else is going to do it for you.",
+  "Work while they sleep. Learn while they party. Save while they spend. Live like they dream.",
+  "A winner is a dreamer who never gives up.",
+  "Success is not measured by what you accomplish, but by the opposition you have encountered.",
+  "Do something today that will inch you closer to a better tomorrow.",
+  "One step at a time is all it takes to get you there.",
+  "It’s never too late to be what you might have been.",
+  "Keep going. Everything you need will come to you at the perfect time."
+]
+
+MOTIV_META_CHAN = "motiv_channel_id"   # meta key for channel id
+MOTIV_META_HOUR = "motiv_hour_utc"     # meta key for posting hour (0–23)
+MOTIV_META_IDX  = "motiv_idx"          # meta key for next quote index
+
+_motiv_task: asyncio.Task | None = None
+
+async def _meta_get(db, key: str, default: str|None=None) -> str|None:
+    cur = await db.execute("SELECT value FROM meta WHERE key=?", (key,))
+    row = await cur.fetchone()
+    return row[0] if row else default
+
+async def _meta_set(db, key: str, value: str):
+    await db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, value))
+    await db.commit()
+
+async def _get_motiv_settings() -> tuple[int|None, int]:
+    """Return (channel_id or None, hour_utc)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        chan_s = await _meta_get(db, MOTIV_META_CHAN)
+        hour_s = await _meta_get(db, MOTIV_META_HOUR, "9")  # default 09:00 UTC
+    chan_id = int(chan_s) if chan_s else None
+    hour = int(hour_s) if hour_s else 9
+    hour = max(0, min(23, hour))
+    return chan_id, hour
+
+async def _next_quote() -> str:
+    if not QUOTES:
+        return "Stay strong. One clean day at a time. 💪"
+    async with aiosqlite.connect(DB_PATH) as db:
+        idx_s = await _meta_get(db, MOTIV_META_IDX, "0")
+        idx = int(idx_s)
+        quote = QUOTES[idx % len(QUOTES)]
+        await _meta_set(db, MOTIV_META_IDX, str((idx + 1) % (10**9)))
+    return quote
+
+async def _sleep_until(hour_utc: int):
+    """Sleep until the next time it's <hour_utc>:00 (UTC)."""
+    now = dt.datetime.now(dt.timezone.utc)
+    target = now.replace(hour=hour_utc, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += dt.timedelta(days=1)
+    await asyncio.sleep((target - now).total_seconds())
+
+async def _post_motivation_once(guild: discord.Guild) -> bool:
+    chan_id, _ = await _get_motiv_settings()
+    if not chan_id:
+        await post_log(guild, "⚠️ Motivation: channel not set. Use /motivation_setchannel here.")
+        return False
+    channel = guild.get_channel(chan_id)
+    if not channel:
+        await post_log(guild, f"⚠️ Motivation: channel {chan_id} not found or bot lacks access.")
+        return False
+    try:
+        quote = await _next_quote()
+        await channel.send(f"🧠 **Daily Motivation**\n> {quote}")
+        return True
+    except Exception as e:
+        await post_log(guild, f"⚠️ Motivation post failed: {e}")
+        return False
+
+async def motivation_loop():
+    await bot.wait_until_ready()
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    # initial delay to next scheduled hour
+    _, hour = await _get_motiv_settings()
+    while not bot.is_closed():
+        await _sleep_until(hour)
+        await _post_motivation_once(guild)
+        # loop does 24h cadence by sleeping to next hour again
+        # but also refresh hour setting in case you changed it
+        _, hour = await _get_motiv_settings()
+
+# -------- Slash commands --------
+mot = app_commands.Group(name="motivation", description="Daily motivation controls")
+
+@mot.command(name="setchannel", description="Bind the current channel for daily motivation posts")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def motivation_setchannel(inter: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _meta_set(db, MOTIV_META_CHAN, str(inter.channel_id))
+    await inter.response.send_message(f"✅ Motivation channel set to <#{inter.channel_id}>.", ephemeral=True)
+
+@mot.command(name="sethour", description="Set the UTC hour (0–23) for daily posts")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def motivation_sethour(inter: discord.Interaction, hour_utc: app_commands.Range[int, 0, 23]):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _meta_set(db, MOTIV_META_HOUR, str(hour_utc))
+    await inter.response.send_message(f"✅ Daily motivation will post at **{hour_utc:02d}:00 UTC**.", ephemeral=True)
+
+@mot.command(name="start", description="Start the daily motivation loop")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def motivation_start(inter: discord.Interaction):
+    global _motiv_task
+    if _motiv_task and not _motiv_task.done():
+        await inter.response.send_message("ℹ️ Motivation loop already running.", ephemeral=True)
+        return
+    _motiv_task = bot.loop.create_task(motivation_loop())
+    await inter.response.send_message("✅ Motivation loop started.", ephemeral=True)
+
+@mot.command(name="stop", description="Stop the daily motivation loop")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def motivation_stop(inter: discord.Interaction):
+    global _motiv_task
+    if _motiv_task and not _motiv_task.done():
+        _motiv_task.cancel()
+        _motiv_task = None
+        await inter.response.send_message("🛑 Motivation loop stopped.", ephemeral=True)
+    else:
+        await inter.response.send_message("ℹ️ Motivation loop was not running.", ephemeral=True)
+
+@mot.command(name="now", description="Post one motivation message right now")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def motivation_now(inter: discord.Interaction):
+    ok = await _post_motivation_once(inter.guild)
+    await inter.response.send_message("✅ Sent." if ok else "⚠️ Failed to send. Check logs.", ephemeral=True)
+
+tree.add_command(mot)
+# ================== /Daily Motivation ==================
+
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} ({bot.user.id})")
