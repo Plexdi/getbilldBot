@@ -36,7 +36,7 @@ INTENTS.reactions = True
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 tree = bot.tree
 
-DB_PATH = "streaks.db"
+DB_PATH = "/data/botdata.sqlite"
 LEADERBOARD_MESSAGE_ID = None   # populated after first run; bot will pin it
 TEST_GUILD = discord.Object(id=GUILD_ID)
 
