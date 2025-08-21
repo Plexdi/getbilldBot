@@ -36,7 +36,7 @@ INTENTS.reactions = True
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 tree = bot.tree
 
-DB_PATH = "/data/getbilldbot-volume"
+DB_PATH = "/data/streaks.db"
 LEADERBOARD_MESSAGE_ID = None   # populated after first run; bot will pin it
 TEST_GUILD = discord.Object(id=GUILD_ID)
 
@@ -307,6 +307,21 @@ async def leaderboard_cmd(interaction: discord.Interaction):
     )
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
+
+@tree.command(name="dbinfo", description="Show quick DB stats")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def dbinfo(inter: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cu1 = await db.execute("SELECT COUNT(*) FROM users")
+        n_users = (await cu1.fetchone())[0]
+        cu2 = await db.execute("SELECT COUNT(*) FROM checkins WHERE status='pending'")
+        n_pending = (await cu2.fetchone())[0]
+        cu3 = await db.execute("SELECT COUNT(*) FROM checkins WHERE status='approved'")
+        n_approved = (await cu3.fetchone())[0]
+    await inter.response.send_message(
+        f"**DB:** `{DB_PATH}`\nUsers: **{n_users}**\nCheckins: **{n_pending} pending**, **{n_approved} approved**",
+        ephemeral=True
+    )
 
 
 @tree.command(name="streak", description="View your current streak")
