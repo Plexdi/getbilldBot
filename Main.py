@@ -77,6 +77,17 @@ CREATE TABLE IF NOT EXISTS meta(
   key TEXT PRIMARY KEY,
   value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS partners(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  requester_id INTEGER NOT NULL,
+  partner_id   INTEGER NOT NULL,
+  status       TEXT NOT NULL,           -- pending|active|declined|cancelled|unlinked
+  created_at   TEXT NOT NULL,
+  UNIQUE(requester_id),
+  UNIQUE(partner_id)
+);
+
 """
 
 async def init_db():
@@ -132,6 +143,152 @@ async def approve_checkin(checkin_id: int, validator_id: int, guild: discord.Gui
         await db.commit()
 
     return user_id, streak
+
+async def _has_open_partner(db, user_id: int) -> tuple[bool, str|None, int|None]:
+    """Return (has_open, status, partner_id) for any pending/active link."""
+    cur = await db.execute("""
+      SELECT status,
+             CASE WHEN requester_id=? THEN partner_id ELSE requester_id END AS other_id
+      FROM partners
+      WHERE (requester_id=? OR partner_id=?)
+        AND status IN ('pending','active')
+      ORDER BY id DESC LIMIT 1
+    """, (user_id, user_id, user_id))
+    row = await cur.fetchone()
+    if not row:
+        return (False, None, None)
+    return (True, row[0], row[1])
+
+async def _create_partner_request(inter: discord.Interaction, target: discord.Member):
+    if target.bot:
+        return "❌ You can’t partner with a bot."
+    if target.id == inter.user.id:
+        return "❌ You can’t partner with yourself."
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Check both sides for existing open link
+        me_open, me_status, _ = await _has_open_partner(db, inter.user.id)
+        if me_open:
+            return f"❌ You already have a **{me_status}** partner link. Use `/partner unlink` or `/partner cancel` first."
+        tg_open, tg_status, _ = await _has_open_partner(db, target.id)
+        if tg_open:
+            return f"❌ {target.mention} already has a **{tg_status}** partner link."
+
+        now = now_utc().isoformat()
+        await db.execute("""
+          INSERT INTO partners(requester_id, partner_id, status, created_at)
+          VALUES(?,?, 'pending', ?)
+        """, (inter.user.id, target.id, now))
+        await db.commit()
+    return None
+
+async def _set_partner_status(db, a_id: int, b_id: int, new_status: str):
+    await db.execute("""
+      UPDATE partners
+      SET status=?
+      WHERE ((requester_id=? AND partner_id=?)
+         OR  (requester_id=? AND partner_id=?))
+        AND status='pending'
+    """, (new_status, a_id, b_id, b_id, a_id))
+    await db.commit()
+
+async def _activate_partner(db, a_id: int, b_id: int):
+    await db.execute("""
+      UPDATE partners
+      SET status='active'
+      WHERE ((requester_id=? AND partner_id=?)
+         OR  (requester_id=? AND partner_id=?))
+        AND status='pending'
+    """, (a_id, b_id, b_id, a_id))
+    await db.commit()
+
+async def _unlink_partner(inter: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+          SELECT requester_id, partner_id, status
+          FROM partners
+          WHERE (requester_id=? OR partner_id=?)
+            AND status='active'
+          ORDER BY id DESC LIMIT 1
+        """, (inter.user.id, inter.user.id))
+        row = await cur.fetchone()
+        if not row:
+            return "❌ You don’t have an active partner."
+
+        a, b, _ = row
+        await db.execute("""
+          UPDATE partners SET status='unlinked'
+          WHERE ((requester_id=? AND partner_id=?)
+             OR  (requester_id=? AND partner_id=?))
+            AND status='active'
+        """, (a, b, b, a))
+        await db.commit()
+    return None
+
+async def _cancel_pending(inter: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+          SELECT id FROM partners
+          WHERE requester_id=? AND status='pending'
+          ORDER BY id DESC LIMIT 1
+        """, (inter.user.id,))
+        row = await cur.fetchone()
+        if not row:
+            return "❌ You don’t have a pending request you started."
+        await db.execute("UPDATE partners SET status='cancelled' WHERE id=?", (row[0],))
+        await db.commit()
+    return None
+
+class PartnerInviteView(discord.ui.View):
+    def __init__(self, requester_id: int, invitee_id: int, timeout: float = 86400):
+        super().__init__(timeout=timeout)  # 24h timeout
+        self.requester_id = requester_id
+        self.invitee_id = invitee_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invitee_id:
+            await interaction.response.send_message("This invite isn’t for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with aiosqlite.connect(DB_PATH) as db:
+            # safety: ensure pending exists for this pair
+            await _activate_partner(db, self.requester_id, self.invitee_id)
+
+        req = interaction.guild.get_member(self.requester_id)
+        inv = interaction.guild.get_member(self.invitee_id)
+
+        await interaction.response.edit_message(
+            content=f"🤝 {inv.mention} **accepted** the partner invite from {req.mention}! You’re now accountability partners.",
+            view=None
+        )
+
+        # Optional: DM both
+        try:
+            if req: await req.send(f"✅ {inv.display_name} accepted your partner request!")
+        except: pass
+        try:
+            if inv: await inv.send(f"✅ You are now partners with {req.display_name}!")
+        except: pass
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await _set_partner_status(db, self.requester_id, self.invitee_id, 'declined')
+
+        req = interaction.guild.get_member(self.requester_id)
+        inv = interaction.guild.get_member(self.invitee_id)
+
+        await interaction.response.edit_message(
+            content=f"❌ {inv.mention} **declined** the partner invite from {req.mention}.",
+            view=None
+        )
+
+        try:
+            if req: await req.send(f"❌ Your partner request to {inv.display_name} was declined.")
+        except: pass
 
 
 def now_utc():
@@ -427,6 +584,48 @@ async def admin_history(inter: discord.Interaction, user: discord.Member, limit:
         tag = "⚠️" if simf else ""
         lines.append(f"• #{cid} — Day {day} — {status} {tag} — {ts}")
     await inter.response.send_message("\n".join(lines), ephemeral=True)
+
+partner = app_commands.Group(name="partner", description="Accountability partner controls")
+
+@partner.command(name="request", description="Ask someone to be your accountability partner")
+async def partner_request(inter: discord.Interaction, user: discord.Member):
+    err = await _create_partner_request(inter, user)
+    if err:
+        return await inter.response.send_message(err, ephemeral=True)
+
+    view = PartnerInviteView(requester_id=inter.user.id, invitee_id=user.id)
+    await inter.response.send_message(
+        content=f"{user.mention} 📨 {inter.user.mention} wants to be accountability partners with you!",
+        view=view
+    )
+
+@partner.command(name="status", description="See your current partner status")
+async def partner_status(inter: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        open_, status, other = await _has_open_partner(db, inter.user.id)
+    if not open_:
+        return await inter.response.send_message("You have no pending or active partner.", ephemeral=True)
+
+    other_txt = f"<@{other}>" if other else "Unknown"
+    await inter.response.send_message(f"Status: **{status}** with {other_txt}", ephemeral=True)
+
+@partner.command(name="cancel", description="Cancel a partner request you sent")
+async def partner_cancel(inter: discord.Interaction):
+    err = await _cancel_pending(inter)
+    if err:
+        return await inter.response.send_message(err, ephemeral=True)
+    await inter.response.send_message("✅ Cancelled your pending request.", ephemeral=True)
+
+@partner.command(name="unlink", description="Unlink your active partner")
+async def partner_unlink(inter: discord.Interaction):
+    err = await _unlink_partner(inter)
+    if err:
+        return await inter.response.send_message(err, ephemeral=True)
+    await inter.response.send_message("🔓 You’re no longer partnered.", ephemeral=True)
+
+# Register group
+tree.add_command(partner)
+
 
 tree.add_command(admin)
 
